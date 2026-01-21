@@ -815,63 +815,67 @@ class CAPPI(object):
         return below, above, out_of_range
 
     def _interpolate_3d(self, gridcoords: np.ndarray, 
-                        mask: np.ndarray = None) -> np.ndarray:
-        """Perform 3D interpolation from polar to Cartesian grid.
-        
-        Uses inverse distance weighting (IDW) for interpolation.
-        
-        Args:
-            gridcoords: Target grid coordinates, shape (num_voxels, 3)
-            mask: Boolean mask for valid voxels
+                            target_height: float,
+                            mask: np.ndarray = None,
+                            v_margin: float = 1000.0) -> np.ndarray:
+            """
+            全向量化 3D 插值
+            v_margin: 垂直方向筛选阈值（米），只取目标高度上下 1km 内的点参与计算
+            """
+            try:
+                from scipy.spatial import cKDTree
+            except ImportError:
+                from scipy.spatial import KDTree as cKDTree
             
-        Returns:
-            Interpolated data for each voxel
-        """
-        try:
-            from scipy.spatial import cKDTree
-            KDTree = cKDTree
-        except ImportError:
-            from scipy.spatial import KDTree
-        
-        # Get valid source points (non-NaN data)
-        valid_mask = ~np.isnan(self.poldata)
-        if not np.any(valid_mask):
-            return np.full(len(gridcoords), np.nan)
-        
-        src_coords = self.polcoords[valid_mask]
-        src_data = self.poldata[valid_mask]
-        
-        # Build KDTree for source points
-        tree = KDTree(src_coords)
-        
-        # Get target indices (unmasked voxels)
-        if mask is not None:
-            trg_indices = np.where(~mask)[0]
-        else:
-            trg_indices = np.arange(len(gridcoords))
-        
-        # Initialize output
-        output = np.full(len(gridcoords), np.nan)
-        
-        # For each target point, find nearest neighbors and interpolate
-        for idx in trg_indices:
-            point = gridcoords[idx]
-            # Find k nearest neighbors
-            dists, indices = tree.query(point, k=10)
+            # 1. 空间过滤：只保留目标高度附近的原始数据点，极大提升 KDTree 构建速度
+            z_dist = np.abs(self.polcoords[:, 2] - target_height)
+            valid_mask = (~np.isnan(self.poldata)) & (z_dist < v_margin)
             
-            if np.any(dists == 0):
-                # Exact match found
-                output[idx] = src_data[indices[0]]
-            elif np.all(dists > 50000):  # Too far
-                continue
-            else:
-                # Inverse distance weighting
-                # Use 1/distance weighting, with minimum distance to avoid division by zero
-                weights = 1.0 / (dists + 1e-6)
-                weights /= weights.sum()
-                output[idx] = np.sum(weights * src_data[indices])
-        
-        return output
+            if not np.any(valid_mask):
+                return np.full(len(gridcoords), np.nan)
+            
+            src_coords = self.polcoords[valid_mask]
+            src_data = self.poldata[valid_mask]
+            
+            # 2. 构建 KDTree
+            tree = cKDTree(src_coords)
+            
+            # 3. 准备目标点
+            trg_indices = np.where(~mask)[0] if mask is not None else np.arange(len(gridcoords))
+            output = np.full(len(gridcoords), np.nan)
+            
+            if len(trg_indices) == 0:
+                return output
+    
+            # 4. 批量查询 (Vectorized Query)
+            # k=10 表示取最近的 10 个点进行 IDW 插值
+            dists, indices = tree.query(gridcoords[trg_indices], k=8, distance_upper_bound=5000)
+            
+            # 5. 批量 IDW 计算
+            # 处理可能的无穷大距离和无效索引（KDTree query 找不到点会返回 len(src_coords)）
+            weights = 1.0 / (dists + 1e-6)
+            
+            # 处理 distance_upper_bound 导致的 inf
+            invalid_dist_mask = np.isinf(dists)
+            weights[invalid_dist_mask] = 0
+            
+            # 归一化权重
+            sum_weights = np.sum(weights, axis=1)
+            # 只处理有有效邻居的点
+            valid_trg_mask = sum_weights > 0
+            
+            # 计算最终值
+            # 使用 np.take 快速获取数据
+            neighbor_data = src_data[indices[valid_trg_mask]]
+            norm_weights = weights[valid_trg_mask] / sum_weights[valid_trg_mask][:, np.newaxis]
+            
+            interpolated_vals = np.sum(norm_weights * neighbor_data, axis=1)
+            
+            # 写回结果
+            actual_indices = trg_indices[valid_trg_mask]
+            output[actual_indices] = interpolated_vals
+            
+            return output
 
     def get_cappi_xy(self, xRange: np.ndarray, yRange: np.ndarray,
                       level_height: float) -> Dataset:
