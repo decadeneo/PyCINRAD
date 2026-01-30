@@ -663,7 +663,7 @@ class CAPPI(object):
         self.polcoords = np.vstack(coords_list)
         self.poldata = np.hstack(data_list)
 
-    def _get_tree(self, height: float, margin: float = 2000.0):
+    def _get_tree(self, height: float, margin: float = 1500.0):
         """获取指定高度范围的KDTree（带缓存）"""
         key = int(height // 500) * 500
         
@@ -676,46 +676,84 @@ class CAPPI(object):
         
         return self._tree_cache[key]
 
+    @staticmethod
+    def _calc_weight(dist: np.ndarray, r: float, method: str = "barnes") -> np.ndarray:
+        """计算插值权重（与pycwr一致）
+        
+        Args:
+            dist: 距离数组
+            r: 影响半径
+            method: 'barnes', 'cressman', 或 'idw'
+        
+        Returns:
+            权重数组
+        """
+        if method == "barnes":
+            # Barnes权重：exp(-4*d²/r²)
+            return np.exp(-4 * dist**2 / r**2)
+        elif method == "cressman":
+            # Cressman权重：(r²-d²)/(d²+r²)
+            return np.maximum(0, (r**2 - dist**2) / (dist**2 + r**2))
+        else:  # idw
+            # 反距离权重：1/d
+            return 1.0 / (dist + 1e-6)
+
     def _interpolate(self, grid: np.ndarray, height: float, 
-                     skip_mask: np.ndarray = None) -> np.ndarray:
-        """3D IDW插值"""
+                     skip_mask: np.ndarray = None,
+                     method: str = "barnes",
+                     influence_radius: float = None) -> np.ndarray:
+        """3D加权插值（标准3D欧氏空间）"""
         result = self._get_tree(height)
         if result[0] is None:
-            return np.full(len(grid), np.nan)
+            return np.full(len(grid), np.nan, dtype=np.float64)
         
-        tree, src_data, n_src = result
-        output = np.full(len(grid), np.nan)
+        tree, src_data_raw, n_src = result
+        src_data = np.asarray(src_data_raw, dtype=np.float64)
+        output = np.full(len(grid), np.nan, dtype=np.float64)
         
-        # 确定需要插值的点
         idx = np.where(~skip_mask)[0] if skip_mask is not None else np.arange(len(grid))
         if len(idx) == 0:
             return output
         
-        # KNN查询 - 使用更大的搜索半径以填补雷达上空空白
-        dist_from_center = np.sqrt(grid[idx, 0]**2 + grid[idx, 1]**2)
-        # 对于距离雷达中心近的点，使用更大的搜索半径
-        max_dist = np.where(dist_from_center < 30000, 15000.0, 8000.0)
+        target_coords = np.asarray(grid[idx], dtype=np.float64)
+        dist_from_center = np.sqrt(target_coords[:, 0]**2 + target_coords[:, 1]**2)
         
-        # 批量查询
-        dists, inds = tree.query(grid[idx], k=6)
+        if influence_radius is None:
+            min_roi = 500.0  # 进一步减小以对齐标准
+            beam_width = 1.0
+            roi = min_roi + (dist_from_center / 1000.0) * beam_width * 20
+        else:
+            roi = np.full(len(idx), influence_radius)
         
-        # IDW权重计算
-        valid = (inds < n_src) & ~np.isinf(dists)
+        # 标准3D查询，不使用Z缩放
+        k_neighbors = 8  # 减少邻居数以避免过度外推
+        dists, inds = tree.query(target_coords, k=k_neighbors)
         
-        # 对每个点应用距离上限
-        for i, md in enumerate(max_dist):
-            valid[i] &= (dists[i] < md)
-        
-        inds = np.where(valid, inds, 0)
-        weights = np.where(valid, 1.0 / (dists + 1e-6), 0.0)
-        
-        w_sum = weights.sum(axis=1)
-        has_data = w_sum > 0
-        
-        if has_data.any():
-            norm_w = weights[has_data] / w_sum[has_data, np.newaxis]
-            output[idx[has_data]] = (norm_w * src_data[inds[has_data]]).sum(axis=1)
-        
+        valid = (inds < n_src)
+        for i in range(len(idx)):
+            v_mask = valid[i]
+            if not v_mask.any():
+                continue
+            
+            d = dists[i, v_mask]
+            r = roi[i]
+            
+            # 过滤超出影响半径的点
+            dist_filter = d < r
+            if not dist_filter.any():
+                continue
+                
+            w = self._calc_weight(d[dist_filter], r, method)
+            v = src_data[inds[i, v_mask][dist_filter]]
+            
+            finite = np.isfinite(v) & (w > 0)
+            if not finite.any():
+                continue
+                
+            w_sum = np.sum(w[finite])
+            if w_sum > 1e-6:
+                output[idx[i]] = np.sum(w[finite] * v[finite]) / w_sum
+                
         return output
 
     def _calc_height_at_dist(self, dist_m: np.ndarray, elevation: float) -> np.ndarray:
@@ -731,53 +769,54 @@ class CAPPI(object):
         return dist_m * np.sin(theta) + dist_m**2 / (2 * RM_M)
 
     def get_cappi_xy(self, xRange: np.ndarray, yRange: np.ndarray,
-                     level_height: float) -> Dataset:
+                     level_height: float, method: str = "barnes") -> Dataset:
         """生成笛卡尔坐标系的CAPPI
 
         Args:
             xRange: 东西向坐标数组（米，相对雷达）
             yRange: 南北向坐标数组（米，相对雷达）
             level_height: CAPPI高度（米）
+            method: 插值方法 'barnes', 'cressman', 或 'idw'（默认barnes，与pycwr一致）
 
         Returns:
             xarray.Dataset: CAPPI数据
         """
-        # 创建网格
+        # 定义网格
         Y, X = np.meshgrid(yRange, xRange, indexing='ij')
         Z = np.full_like(X, level_height)
         grid = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
         
-        # 计算盲区
-        dist = np.sqrt(grid[:, 0]**2 + grid[:, 1]**2)
+        # 计算盲区（恢复物理采样范围限制）
+        dist_2d = np.sqrt(X**2 + Y**2).ravel()
         min_el, max_el = self.elev_angles.min(), self.elev_angles.max()
         
-        # 高度范围（使用与projection.height一致的公式）
-        h_min = self._calc_height_at_dist(dist, min_el)
-        h_max = self._calc_height_at_dist(dist, max_el)
+        h_min = self._calc_height_at_dist(dist_2d, min_el)
+        h_max = self._calc_height_at_dist(dist_2d, max_el)
         
-        # 对于距离雷达较近的区域（<30km），放宽盲区限制
-        near_radar = dist < 30000
-        skip = np.where(near_radar,
-                        False,  # 近雷达区域不跳过
-                        (grid[:, 2] < h_min) | (grid[:, 2] > h_max) | (dist > max(abs(xRange.max()), abs(yRange.max())) * 1.5))
+        # 允许极小余量
+        margin_h = 500.0 
+        skip = (grid[:, 2] < h_min - margin_h) | (grid[:, 2] > h_max + margin_h) | \
+               (dist_2d > max(abs(xRange.max()), abs(yRange.max())) * 1.5)
         
         # 插值
-        cappi = self._interpolate(grid, level_height, skip).reshape(len(yRange), len(xRange))
+        cappi = self._interpolate(grid, level_height, skip, method=method).reshape(len(yRange), len(xRange))
         
         # 构建结果
         ret = Dataset({self.dtype: DataArray(cappi, coords=[yRange, xRange], dims=["y", "x"])})
         ret.attrs = {**self.attrs, "cappi_height": level_height, 
-                     "elevation": level_height / 1000.0}
+                     "elevation": level_height / 1000.0,
+                     "interpolation_method": method}
         return ret
 
     def get_cappi_lonlat(self, XLon: np.ndarray, YLat: np.ndarray,
-                         level_height: float) -> Dataset:
+                         level_height: float, method: str = "barnes") -> Dataset:
         """生成经纬度坐标系的CAPPI
 
         Args:
             XLon: 经度数组（度）
             YLat: 纬度数组（度）
             level_height: CAPPI高度（米）
+            method: 插值方法 'barnes', 'cressman', 或 'idw'
 
         Returns:
             xarray.Dataset: CAPPI数据
@@ -787,7 +826,7 @@ class CAPPI(object):
         yRange = (YLat - self.radar_lat) * self.LAT_TO_M
         
         # 计算CAPPI
-        cappi_xy = self.get_cappi_xy(xRange, yRange, level_height)
+        cappi_xy = self.get_cappi_xy(xRange, yRange, level_height, method=method)
         
         # 转换坐标
         ret = Dataset({self.dtype: DataArray(
@@ -795,4 +834,5 @@ class CAPPI(object):
         )})
         ret.attrs = cappi_xy.attrs
         return ret
+
 
